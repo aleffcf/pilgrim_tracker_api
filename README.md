@@ -646,7 +646,7 @@ The project is also structured to allow future expansion into real-time tracking
 
 This project is **proprietary software**.
 
-The source code is publicly available for portfolio and evaluation purposes.
+The source code is publicly available for portfolio, study and evaluation.
 
 Viewing the source code does not grant permission to copy, modify, distribute, sublicense, or use the software commercially without prior written permission from the copyright holder.
 
