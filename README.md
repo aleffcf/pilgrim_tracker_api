@@ -395,7 +395,7 @@ Used to protect the login endpoint against excessive authentication attempts.
 
 ```bash
 git clone <repository-url>
-cd aparecida-pilgrim-api
+cd pilgrim_tracker_app
 ```
 
 ## Create a virtual environment
