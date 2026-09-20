@@ -35,10 +35,10 @@ engine = create_async_engine(
 )
 
 # ---------- Configuração de autenticação ----------
-# Gerar com `openssl rand -hex 32`
-JWT_SECRET = os.getenv("JWT_SECRET")
+JWT_SECRET = os.getenv("JWT_SECRET")  # obrigatório: gere com `openssl rand -hex 32`
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_DAYS = 365
+ACCESS_TOKEN_EXPIRE_DAYS = 365  # token de longa duração: o app guarda e reusa, sem pedir login de novo
+
 # Chave usada só para criar o primeiro admin de um tenant (bootstrap).
 # Depois disso, admins autenticam normalmente via JWT.
 ADMIN_SETUP_KEY = os.getenv("ADMIN_SETUP_KEY")
@@ -95,7 +95,15 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
-app = FastAPI(lifespan=lifespan)
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
+app = FastAPI(
+    lifespan=lifespan,
+    # Em produção, ninguém de fora precisa ver a documentação interativa.
+    docs_url="/docs" if ENVIRONMENT != "production" else None,
+    redoc_url="/redoc" if ENVIRONMENT != "production" else None,
+    openapi_url="/openapi.json" if ENVIRONMENT != "production" else None,
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -202,9 +210,8 @@ class TenantExists(BaseModel):
     exists: bool
 
 
-# devolvido em texto puro só nesta resposta, uma única vez
 class UserCreatedResponse(UserBase):
-    access_code: str 
+    access_code: str  # devolvido em texto puro só nesta resposta, uma única vez
 
 
 class LoginRequest(BaseModel):
@@ -240,7 +247,17 @@ class PersonLocation(BaseModel):
 # ---------- Rotas: Tenant ----------
 
 @app.post("/tenant", response_model=TenantBase)
-async def create_tenant(tenant: TenantCreate, db: AsyncSession = Depends(get_db)):
+async def create_tenant(
+    tenant: TenantCreate,
+    db: AsyncSession = Depends(get_db),
+    x_setup_key: str = Header(...),
+):
+    """Criar um grupo/tenant novo é uma ação administrativa da sua infra —
+    protegida pela mesma chave de setup do bootstrap de admin, não por login
+    de usuário (ainda não existe nenhum usuário nesse tenant nesse momento)."""
+    if not ADMIN_SETUP_KEY or not secrets.compare_digest(x_setup_key, ADMIN_SETUP_KEY):
+        raise HTTPException(status_code=403, detail="Chave de setup inválida")
+
     db_tenant = Tenant(
         full_name=tenant.full_name,
         slug=tenant.slug,
@@ -267,8 +284,12 @@ async def tenant_exists(join_code: str, db: AsyncSession = Depends(get_db)):
 # ---------- Rotas: User ----------
 
 @app.get("/users", response_model=list[UserBase])
-async def get_users(db: AsyncSession = Depends(get_db)):
-    results = await db.execute(select(User))
+async def get_users(
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Lista os usuários do MESMO tenant do admin logado — nunca de outros grupos."""
+    results = await db.execute(select(User).where(User.tenant_id == current_admin.tenant_id))
     users = results.scalars().all()
     return users
 
@@ -363,7 +384,9 @@ async def update_location(
 ):
     current_user.last_latitude = payload.latitude
     current_user.last_longitude = payload.longitude
-    current_user.last_seen_at = datetime.now(timezone.utc)
+    # A coluna é TIMESTAMP WITHOUT TIME ZONE — removemos o tzinfo aqui,
+    # já que o valor já está em UTC (só o Postgres não aceita o marcador).
+    current_user.last_seen_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
     return {"ok": True}
 
