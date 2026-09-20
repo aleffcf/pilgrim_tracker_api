@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy import select, func, ForeignKey
+from sqlalchemy import select, func, ForeignKey, JSON
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
@@ -64,6 +64,9 @@ class Tenant(Base):
     slug: Mapped[str] = mapped_column(nullable=False, unique=True)
     join_code: Mapped[str] = mapped_column(nullable=False, unique=True)
     max_accounts: Mapped[int] = mapped_column(nullable=False, server_default="5")
+    # Lista de {"latitude": .., "longitude": ..} em ordem — a rota fixa do
+    # grupo, desenhada no mapa. None/[] quando ainda não foi configurada.
+    route_points: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now(), nullable=False
@@ -78,9 +81,20 @@ class User(Base):
     tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), nullable=False)
     access_code_hash: Mapped[str] = mapped_column(nullable=False)
     is_admin: Mapped[bool] = mapped_column(nullable=False, server_default="false")
+    # Perfil complementar — tudo opcional, pode ser preenchido pelo admin no
+    # cadastro ou pelo próprio usuário depois, editando o próprio perfil.
+    nome: Mapped[str | None] = mapped_column(nullable=True)
+    sobrenome: Mapped[str | None] = mapped_column(nullable=True)
+    idade: Mapped[int | None] = mapped_column(nullable=True)
+    tipo_sanguineo: Mapped[str | None] = mapped_column(nullable=True)
+    telefone: Mapped[str | None] = mapped_column(nullable=True)
+    contato_emergencia_nome: Mapped[str | None] = mapped_column(nullable=True)
+    contato_emergencia_telefone: Mapped[str | None] = mapped_column(nullable=True)
     last_latitude: Mapped[float | None] = mapped_column(nullable=True)
     last_longitude: Mapped[float | None] = mapped_column(nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    sos_ativo: Mapped[bool] = mapped_column(nullable=False, server_default="false")
+    sos_acionado_em: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now(), nullable=False
@@ -181,13 +195,41 @@ class UserBase(BaseModel):
     id: int
     username: str
     tenant_id: int
+    is_admin: bool
+    nome: str | None = None
+    sobrenome: str | None = None
+    idade: int | None = None
+    tipo_sanguineo: str | None = None
+    telefone: str | None = None
+    contato_emergencia_nome: str | None = None
+    contato_emergencia_telefone: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class UserCreate(BaseModel):
+    # Sem tenant_join_code: quem cadastra agora é um admin autenticado,
+    # e o tenant já é conhecido pelo token dele.
     username: str
-    tenant_join_code: str  # código escaneado via QR pelo app
+    nome: str | None = None
+    sobrenome: str | None = None
+    idade: int | None = None
+    tipo_sanguineo: str | None = None
+    telefone: str | None = None
+    contato_emergencia_nome: str | None = None
+    contato_emergencia_telefone: str | None = None
+
+
+class UserProfileUpdate(BaseModel):
+    # Usado pelo próprio usuário para editar seu perfil — tudo opcional,
+    # só os campos enviados são alterados (exclude_unset na rota).
+    nome: str | None = None
+    sobrenome: str | None = None
+    idade: int | None = None
+    tipo_sanguineo: str | None = None
+    telefone: str | None = None
+    contato_emergencia_nome: str | None = None
+    contato_emergencia_telefone: str | None = None
 
 
 class TenantBase(BaseModel):
@@ -240,6 +282,22 @@ class PersonLocation(BaseModel):
     latitude: float
     longitude: float
     last_seen_at: datetime
+    sos_ativo: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RoutePoint(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class RouteUpdate(BaseModel):
+    points: list[RoutePoint]
+
+
+class RouteResponse(BaseModel):
+    points: list[RoutePoint]
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -295,16 +353,17 @@ async def get_users(
 
 
 @app.post("/user", response_model=UserCreatedResponse)
-async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
-    # 1. Verifica se o tenant existe (pelo código escaneado via QR)
-    result = await db.execute(
-        select(Tenant).where(Tenant.join_code == user.tenant_join_code.upper())
-    )
-    tenant = result.scalar_one_or_none()
-    if tenant is None:
-        raise HTTPException(status_code=404, detail="Grupo não encontrado")
+async def create_user(
+    dados: UserCreate,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Cadastro de peregrino — agora é uma ação exclusiva do admin do grupo.
+    Não existe mais autocadastro público: o tenant já é conhecido pelo
+    token do admin, não é mais informado no corpo da requisição."""
+    result = await db.execute(select(Tenant).where(Tenant.id == current_admin.tenant_id))
+    tenant = result.scalar_one()
 
-    # 2. Verifica o limite de contas/licenças do tenant
     count_result = await db.execute(
         select(func.count()).select_from(User).where(User.tenant_id == tenant.id)
     )
@@ -312,17 +371,21 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
     if current_accounts >= tenant.max_accounts:
         raise HTTPException(
             status_code=403,
-            detail="Limite de contas/licenças atingido para este tenant",
+            detail="Limite de contas/licenças atingido para este grupo",
         )
 
-    # 3. Gera o código de acesso (só existe em texto puro neste momento)
     access_code = generate_access_code()
-
-    # 4. Cria o usuário vinculado ao tenant, guardando só o hash do código
     db_user = User(
-        username=user.username,
+        username=dados.username,
         tenant_id=tenant.id,
         access_code_hash=hash_access_code(access_code),
+        nome=dados.nome,
+        sobrenome=dados.sobrenome,
+        idade=dados.idade,
+        tipo_sanguineo=dados.tipo_sanguineo,
+        telefone=dados.telefone,
+        contato_emergencia_nome=dados.contato_emergencia_nome,
+        contato_emergencia_telefone=dados.contato_emergencia_telefone,
     )
     db.add(db_user)
     try:
@@ -332,11 +395,8 @@ async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=409, detail="Username já está em uso")
     await db.refresh(db_user)
 
-    # Monta a resposta incluindo o código em texto puro (única vez que ele aparece)
     return UserCreatedResponse(
-        id=db_user.id,
-        username=db_user.username,
-        tenant_id=db_user.tenant_id,
+        **UserBase.model_validate(db_user).model_dump(),
         access_code=access_code,
     )
 
@@ -371,6 +431,22 @@ async def login(request: Request, credentials: LoginRequest, db: AsyncSession = 
 async def read_current_user(current_user: User = Depends(get_current_user)):
     """Exemplo de rota protegida — use Depends(get_current_user) em qualquer
     rota que precise saber quem é o peregrino logado (ex: enviar localização)."""
+    return current_user
+
+
+@app.patch("/me", response_model=UserBase)
+async def update_my_profile(
+    payload: UserProfileUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cada usuário só edita o PRÓPRIO perfil — nunca recebe um user_id no
+    path, current_user já garante isso."""
+    dados = payload.model_dump(exclude_unset=True)
+    for campo, valor in dados.items():
+        setattr(current_user, campo, valor)
+    await db.commit()
+    await db.refresh(current_user)
     return current_user
 
 
@@ -411,9 +487,69 @@ async def get_pessoas(
             latitude=u.last_latitude,
             longitude=u.last_longitude,
             last_seen_at=u.last_seen_at,
+            sos_ativo=u.sos_ativo,
         )
         for u in users
     ]
+
+
+# ---------- Rotas: SOS ----------
+
+@app.post("/sos")
+async def acionar_sos(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """O próprio usuário aciona — a confirmação ("tem certeza?") é feita no
+    app antes de chamar essa rota, aqui já é o acionamento de verdade."""
+    current_user.sos_ativo = True
+    current_user.sos_acionado_em = datetime.now(timezone.utc).replace(tzinfo=None)
+    await db.commit()
+    return {"ok": True}
+
+
+@app.post("/sos/{user_id}/resolver")
+async def resolver_sos(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Admin marca o alerta como atendido/resolvido."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    target = result.scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    if target.tenant_id != current_admin.tenant_id:
+        raise HTTPException(status_code=403, detail="Usuário pertence a outro grupo")
+
+    target.sos_ativo = False
+    await db.commit()
+    return {"ok": True}
+
+
+# ---------- Rotas: Rota fixa do grupo ----------
+
+@app.get("/tenant/route", response_model=RouteResponse)
+async def get_route(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
+    tenant = result.scalar_one()
+    return RouteResponse(points=tenant.route_points or [])
+
+
+@app.put("/tenant/route", response_model=RouteResponse)
+async def update_route(
+    payload: RouteUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    result = await db.execute(select(Tenant).where(Tenant.id == current_admin.tenant_id))
+    tenant = result.scalar_one()
+    tenant.route_points = [p.model_dump() for p in payload.points]
+    await db.commit()
+    return RouteResponse(points=payload.points)
 
 
 # ---------- Rotas: Admin ----------
@@ -453,9 +589,7 @@ async def bootstrap_admin(
     await db.refresh(db_user)
 
     return UserCreatedResponse(
-        id=db_user.id,
-        username=db_user.username,
-        tenant_id=db_user.tenant_id,
+        **UserBase.model_validate(db_user).model_dump(),
         access_code=access_code,
     )
 
@@ -498,8 +632,6 @@ async def reset_user_code(
     await db.refresh(target)
 
     return UserCreatedResponse(
-        id=target.id,
-        username=target.username,
-        tenant_id=target.tenant_id,
+        **UserBase.model_validate(target).model_dump(),
         access_code=novo_codigo,
     )
