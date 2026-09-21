@@ -196,6 +196,7 @@ class UserBase(BaseModel):
     username: str
     tenant_id: int
     is_admin: bool
+    sos_ativo: bool
     nome: str | None = None
     sobrenome: str | None = None
     idade: int | None = None
@@ -208,10 +209,10 @@ class UserBase(BaseModel):
 
 
 class UserCreate(BaseModel):
-    # Sem tenant_join_code: quem cadastra agora é um admin autenticado,
-    # e o tenant já é conhecido pelo token dele.
-    username: str
-    nome: str | None = None
+    # username não existe mais como conceito do usuário — é gerado
+    # internamente só pra satisfazer a constraint de unicidade no banco.
+    # A identidade real do peregrino agora é nome + sobrenome.
+    nome: str
     sobrenome: str | None = None
     idade: int | None = None
     tipo_sanguineo: str | None = None
@@ -278,7 +279,9 @@ class LocationUpdate(BaseModel):
 
 class PersonLocation(BaseModel):
     id: int
-    username: str
+    nome: str | None = None
+    sobrenome: str | None = None
+    tipo_sanguineo: str | None = None
     latitude: float
     longitude: float
     last_seen_at: datetime
@@ -376,7 +379,10 @@ async def create_user(
 
     access_code = generate_access_code()
     db_user = User(
-        username=dados.username,
+        # username agora é só um identificador técnico interno (nunca
+        # mostrado no app) — gerado a partir do nome + sufixo aleatório
+        # pra satisfazer a constraint de unicidade do banco.
+        username=f"{dados.nome.lower().replace(' ', '_')}_{secrets.token_hex(3)}",
         tenant_id=tenant.id,
         access_code_hash=hash_access_code(access_code),
         nome=dados.nome,
@@ -483,7 +489,9 @@ async def get_pessoas(
     return [
         PersonLocation(
             id=u.id,
-            username=u.username,
+            nome=u.nome,
+            sobrenome=u.sobrenome,
+            tipo_sanguineo=u.tipo_sanguineo,
             latitude=u.last_latitude,
             longitude=u.last_longitude,
             last_seen_at=u.last_seen_at,
