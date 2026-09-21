@@ -314,6 +314,19 @@ class RouteUpdate(BaseModel):
 class RouteResponse(BaseModel):
     points: list[RoutePoint]
 
+
+class SosAlerta(BaseModel):
+    id: int
+    nome: str | None = None
+    sobrenome: str | None = None
+    telefone: str | None = None
+    tipo_sanguineo: str | None = None
+    sos_acionado_em: datetime | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -553,6 +566,35 @@ async def resolver_sos(
     target.sos_ativo = False
     await db.commit()
     return {"ok": True}
+
+
+@app.get("/sos/ativos", response_model=list[SosAlerta])
+async def listar_sos_ativos(
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Tela centralizada de alertas — todos os SOS ativos do grupo, sem
+    precisar procurar o pin de cada pessoa no mapa."""
+    result = await db.execute(
+        select(User).where(
+            User.tenant_id == current_admin.tenant_id,
+            User.sos_ativo == True,  # noqa: E712
+        )
+    )
+    users = result.scalars().all()
+    return [
+        SosAlerta(
+            id=u.id,
+            nome=u.nome,
+            sobrenome=u.sobrenome,
+            telefone=u.telefone,
+            tipo_sanguineo=u.tipo_sanguineo,
+            sos_acionado_em=u.sos_acionado_em,
+            latitude=u.last_latitude,
+            longitude=u.last_longitude,
+        )
+        for u in users
+    ]
 
 
 # ---------- Rotas: Rota fixa do grupo ----------
