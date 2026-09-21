@@ -95,6 +95,10 @@ class User(Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(nullable=True)
     sos_ativo: Mapped[bool] = mapped_column(nullable=False, server_default="false")
     sos_acionado_em: Mapped[datetime | None] = mapped_column(nullable=True)
+    # Incrementado a cada login — um token só é válido se carregar a MESMA
+    # versão que está salva aqui. Login novo → versão nova → tokens antigos
+    # (de outros dispositivos) passam a ser rejeitados automaticamente.
+    session_version: Mapped[int] = mapped_column(nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now(), nullable=False
@@ -159,9 +163,9 @@ def verify_access_code(code: str, code_hash: str) -> bool:
     return bcrypt.checkpw(code.encode("utf-8"), code_hash.encode("utf-8"))
 
 
-def create_access_token(user_id: int, tenant_id: int) -> str:
+def create_access_token(user_id: int, tenant_id: int, session_version: int) -> str:
     expire = datetime.now(timezone.utc) + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
-    payload = {"sub": str(user_id), "tenant_id": tenant_id, "exp": expire}
+    payload = {"sub": str(user_id), "tenant_id": tenant_id, "sv": session_version, "exp": expire}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
@@ -173,6 +177,7 @@ async def get_current_user(
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user_id = int(payload["sub"])
+        token_session_version = payload.get("sv")
     except (jwt.PyJWTError, KeyError, ValueError):
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
 
@@ -180,6 +185,13 @@ async def get_current_user(
     user = result.scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=401, detail="Usuário não encontrado")
+
+    if token_session_version != user.session_version:
+        raise HTTPException(
+            status_code=401,
+            detail="Sessão expirada — foi feito login com este código em outro dispositivo",
+        )
+
     return user
 
 
@@ -429,7 +441,15 @@ async def login(request: Request, credentials: LoginRequest, db: AsyncSession = 
     if matched_user is None:
         raise HTTPException(status_code=401, detail="Grupo ou código inválido")
 
-    token = create_access_token(user_id=matched_user.id, tenant_id=tenant.id)
+    # Invalida qualquer sessão anterior desse usuário (outro dispositivo)
+    matched_user.session_version += 1
+    await db.commit()
+
+    token = create_access_token(
+        user_id=matched_user.id,
+        tenant_id=tenant.id,
+        session_version=matched_user.session_version,
+    )
     return TokenResponse(access_token=token)
 
 
