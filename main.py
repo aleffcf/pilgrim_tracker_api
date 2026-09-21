@@ -683,6 +683,42 @@ async def promote_user(
     return target
 
 
+@app.post("/user/{user_id}/demote", response_model=UserBase)
+async def demote_user(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    result = await db.execute(select(User).where(User.id == user_id))
+    target = result.scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    if target.tenant_id != current_admin.tenant_id:
+        raise HTTPException(status_code=403, detail="Usuário pertence a outro grupo")
+    if not target.is_admin:
+        raise HTTPException(status_code=400, detail="Usuário já não é admin")
+
+    # Nunca deixa o grupo sem nenhum admin — senão ninguém mais consegue
+    # gerenciar membros, cadastrar peregrinos ou resolver alertas de SOS.
+    count_result = await db.execute(
+        select(func.count()).select_from(User).where(
+            User.tenant_id == current_admin.tenant_id,
+            User.is_admin == True,  # noqa: E712
+        )
+    )
+    total_admins = count_result.scalar_one()
+    if total_admins <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Não é possível rebaixar o último admin do grupo",
+        )
+
+    target.is_admin = False
+    await db.commit()
+    await db.refresh(target)
+    return target
+
+
 @app.post("/user/{user_id}/reset-code", response_model=UserCreatedResponse)
 async def reset_user_code(
     user_id: int,
