@@ -1,5 +1,6 @@
 import os
 import secrets
+from typing import Literal
 from dotenv import load_dotenv
 
 from datetime import datetime, timedelta, timezone
@@ -102,6 +103,13 @@ class User(Base):
     # Vincula o código de acesso a UM dispositivo — None até o primeiro
     # login, depois disso só aquele dispositivo pode logar com esse código.
     device_id: Mapped[str | None] = mapped_column(nullable=True)
+    # "peregrino" (padrão, rastreado por GPS), "apoio" (equipe de apoio,
+    # também rastreada por GPS) ou "local" (ponto fixo, posição definida
+    # manualmente pelo admin — não precisa de GPS nem de login de verdade).
+    tipo_usuario: Mapped[str] = mapped_column(nullable=False, server_default="peregrino")
+    # Estado da chamada/presença do dia — persistido no banco de propósito,
+    # assim qualquer admin vê e continua de onde outro parou.
+    presente: Mapped[bool] = mapped_column(nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now(), nullable=False
@@ -212,6 +220,8 @@ class UserBase(BaseModel):
     tenant_id: int
     is_admin: bool
     sos_ativo: bool
+    tipo_usuario: str
+    presente: bool
     nome: str | None = None
     sobrenome: str | None = None
     idade: int | None = None
@@ -234,6 +244,7 @@ class UserCreate(BaseModel):
     telefone: str | None = None
     contato_emergencia_nome: str | None = None
     contato_emergencia_telefone: str | None = None
+    tipo_usuario: Literal["peregrino", "apoio", "local"] = "peregrino"
 
 
 class UserProfileUpdate(BaseModel):
@@ -302,8 +313,24 @@ class PersonLocation(BaseModel):
     longitude: float
     last_seen_at: datetime
     sos_ativo: bool
+    tipo_usuario: str
+    is_admin: bool
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class LocationSet(BaseModel):
+    """Para o admin definir manualmente a posição de um usuário tipo 'local'."""
+    latitude: float
+    longitude: float
+
+
+class PresencaUpdate(BaseModel):
+    presente: bool
+
+
+class TipoUsuarioUpdate(BaseModel):
+    tipo_usuario: Literal["peregrino", "apoio", "local"]
 
 
 class RoutePoint(BaseModel):
@@ -421,6 +448,7 @@ async def create_user(
         telefone=dados.telefone,
         contato_emergencia_nome=dados.contato_emergencia_nome,
         contato_emergencia_telefone=dados.contato_emergencia_telefone,
+        tipo_usuario=dados.tipo_usuario,
     )
     db.add(db_user)
     try:
@@ -524,6 +552,94 @@ async def update_location(
     return {"ok": True}
 
 
+@app.put("/user/{user_id}/tipo", response_model=UserBase)
+async def definir_tipo_usuario(
+    user_id: int,
+    payload: TipoUsuarioUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    result = await db.execute(select(User).where(User.id == user_id))
+    target = result.scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    if target.tenant_id != current_admin.tenant_id:
+        raise HTTPException(status_code=403, detail="Usuário pertence a outro grupo")
+
+    target.tipo_usuario = payload.tipo_usuario
+    await db.commit()
+    await db.refresh(target)
+    return target
+
+
+@app.put("/user/{user_id}/location", response_model=UserBase)
+async def definir_localizacao_manual(
+    user_id: int,
+    payload: LocationSet,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Só faz sentido pra usuários tipo 'local' — um ponto fixo no mapa
+    (posto de apoio, ponto de encontro) que o admin posiciona manualmente,
+    sem depender de ninguém carregando o celular ali."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    target = result.scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    if target.tenant_id != current_admin.tenant_id:
+        raise HTTPException(status_code=403, detail="Usuário pertence a outro grupo")
+    if target.tipo_usuario != "local":
+        raise HTTPException(
+            status_code=400,
+            detail="Só é possível definir posição manual para usuários do tipo 'local'",
+        )
+
+    target.last_latitude = payload.latitude
+    target.last_longitude = payload.longitude
+    target.last_seen_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    await db.commit()
+    await db.refresh(target)
+    return target
+
+
+# ---------- Rotas: Chamada / presença ----------
+
+@app.post("/user/{user_id}/presenca", response_model=UserBase)
+async def marcar_presenca(
+    user_id: int,
+    payload: PresencaUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    result = await db.execute(select(User).where(User.id == user_id))
+    target = result.scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    if target.tenant_id != current_admin.tenant_id:
+        raise HTTPException(status_code=403, detail="Usuário pertence a outro grupo")
+
+    target.presente = payload.presente
+    await db.commit()
+    await db.refresh(target)
+    return target
+
+
+@app.post("/chamada/resetar")
+async def resetar_chamada(
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Zera a presença de TODO MUNDO do grupo de uma vez — uso típico: no
+    início de um novo dia de romaria, antes de fazer a chamada daquele dia."""
+    await db.execute(
+        User.__table__.update()
+        .where(User.tenant_id == current_admin.tenant_id)
+        .values(presente=False)
+    )
+    await db.commit()
+    return {"ok": True}
+
+
 @app.get("/pessoas", response_model=list[PersonLocation])
 async def get_pessoas(
     db: AsyncSession = Depends(get_db),
@@ -547,6 +663,8 @@ async def get_pessoas(
             longitude=u.last_longitude,
             last_seen_at=u.last_seen_at,
             sos_ativo=u.sos_ativo,
+            tipo_usuario=u.tipo_usuario,
+            is_admin=u.is_admin,
         )
         for u in users
     ]
