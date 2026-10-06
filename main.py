@@ -99,6 +99,9 @@ class User(Base):
     # versão que está salva aqui. Login novo → versão nova → tokens antigos
     # (de outros dispositivos) passam a ser rejeitados automaticamente.
     session_version: Mapped[int] = mapped_column(nullable=False, server_default="0")
+    # Vincula o código de acesso a UM dispositivo — None até o primeiro
+    # login, depois disso só aquele dispositivo pode logar com esse código.
+    device_id: Mapped[str | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now(), nullable=False
@@ -272,6 +275,7 @@ class UserCreatedResponse(UserBase):
 class LoginRequest(BaseModel):
     tenant_join_code: str
     access_code: str
+    device_id: str  # identificador estável do aparelho (Android ID / vendor ID no iOS)
 
 
 class TokenResponse(BaseModel):
@@ -454,7 +458,21 @@ async def login(request: Request, credentials: LoginRequest, db: AsyncSession = 
     if matched_user is None:
         raise HTTPException(status_code=401, detail="Grupo ou código inválido")
 
-    # Invalida qualquer sessão anterior desse usuário (outro dispositivo)
+    # Vínculo com dispositivo: primeiro login "gruda" o código nesse
+    # aparelho; logins seguintes só passam se vierem do MESMO aparelho.
+    if matched_user.device_id is None:
+        matched_user.device_id = credentials.device_id
+    elif matched_user.device_id != credentials.device_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Este código já está em uso em outro aparelho. "
+                "Peça ao organizador do grupo para gerar um novo código."
+            ),
+        )
+
+    # Invalida qualquer sessão anterior desse usuário (mesmo dispositivo
+    # relogando também gera um token novo, o antigo para de valer)
     matched_user.session_version += 1
     await db.commit()
 
@@ -734,6 +752,9 @@ async def reset_user_code(
 
     novo_codigo = generate_access_code()
     target.access_code_hash = hash_access_code(novo_codigo)
+    # Libera o vínculo de dispositivo — o código novo pode ser ativado em
+    # qualquer aparelho (útil se o peregrino perdeu o celular/crachá antigo).
+    target.device_id = None
     await db.commit()
     await db.refresh(target)
 
