@@ -602,6 +602,19 @@ async def definir_localizacao_manual(
 
 # ---------- Rotas: Chamada / presença ----------
 
+@app.post("/presenca/checkin", response_model=UserBase)
+async def autocheckin_presenca(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """O próprio peregrino marca "cheguei" — só liga pra true, nunca desliga
+    (desfazer é ação do admin, evita toque acidental apagando a presença)."""
+    current_user.presente = True
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+
 @app.post("/user/{user_id}/presenca", response_model=UserBase)
 async def marcar_presenca(
     user_id: int,
@@ -796,6 +809,58 @@ async def bootstrap_admin(
         **UserBase.model_validate(db_user).model_dump(),
         access_code=access_code,
     )
+
+
+@app.get("/user/{user_id}", response_model=UserBase)
+async def get_user_detail(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    """Admin vendo os dados completos de um membro do próprio grupo."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    target = result.scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    if target.tenant_id != current_admin.tenant_id:
+        raise HTTPException(status_code=403, detail="Usuário pertence a outro grupo")
+    return target
+
+
+@app.delete("/user/{user_id}")
+async def delete_user(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(get_current_admin),
+):
+    result = await db.execute(select(User).where(User.id == user_id))
+    target = result.scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado")
+    if target.tenant_id != current_admin.tenant_id:
+        raise HTTPException(status_code=403, detail="Usuário pertence a outro grupo")
+    if target.id == current_admin.id:
+        raise HTTPException(
+            status_code=400, detail="Não é possível excluir a própria conta por aqui"
+        )
+
+    # Mesma proteção do demote: nunca deixa o grupo sem nenhum admin
+    if target.is_admin:
+        count_result = await db.execute(
+            select(func.count()).select_from(User).where(
+                User.tenant_id == current_admin.tenant_id,
+                User.is_admin == True,  # noqa: E712
+            )
+        )
+        total_admins = count_result.scalar_one()
+        if total_admins <= 1:
+            raise HTTPException(
+                status_code=400, detail="Não é possível excluir o último admin do grupo"
+            )
+
+    await db.delete(target)
+    await db.commit()
+    return {"ok": True}
 
 
 @app.post("/user/{user_id}/promote", response_model=UserBase)
